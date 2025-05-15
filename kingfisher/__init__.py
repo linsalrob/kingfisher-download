@@ -23,6 +23,7 @@ DEFAULT_OUTPUT_FORMAT_POSSIBILITIES = ['fastq', 'fastq.gz']
 DEFAULT_THREADS = 8
 DEFAULT_DOWNLOAD_THREADS = DEFAULT_THREADS
 DEFAULT_ASCP_ARGS = '-k 2'
+DEFAULT_ATTEMPTS = 3
 
 class OutputLocation:
     def __init__(self, output_directory):
@@ -95,6 +96,7 @@ def download_and_extract_one_run(run_identifier, **kwargs):
     prefetch_max_size = kwargs.pop('prefetch_max_size',None)
     check_md5sums = kwargs.pop('check_md5sums', False)
     output_directory = kwargs.pop('output_directory', '.')
+    attempts = kwargs.pop('attempts', DEFAULT_ATTEMPTS)
 
     if len(kwargs) > 0:
         raise Exception("Unexpected arguments detected: %s" % kwargs)
@@ -142,219 +144,242 @@ def download_and_extract_one_run(run_identifier, **kwargs):
         # Download phase
         worked = False
         for method in download_methods:
-            logging.info("Attempting download method {} for run {} ..".format(method, run_identifier))
-            if method == 'prefetch':
-                output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
-                try:
-                    if prefetch_max_size is None:
-                        prefetch_max_size_argument = '--max-size 0G'
-                    else:
-                        prefetch_max_size_argument = '--max-size {}'.format(prefetch_max_size)
-                    extern.run("prefetch {} -o {} {}".format(
-                        prefetch_max_size_argument, output_path, run_identifier))
-                    if os.path.exists(output_path):
-                        downloaded_files = [output_path]
-                    else:
-                        logging.warning("Method {} failed: Prefetch did not create file {}".format(method, output_path))
-                except ExternCalledProcessError as e:
-                    logging.warning("Method {} failed: Error was: {}".format(method, e))
-                    if os.path.exists(output_path):
-                        logging.info("Removing file {} because download failed ..".format(output_path))
-                        os.remove(output_path)
-                
-            elif method == 'aws-http':
-                def download_from_aws(odp_link, run_identifier, download_threads, method):
+            this_attempt = 0
+            while downloaded_files is None and this_attempt < attempts:
+                this_attempt += 1
+                logging.info("Attempt {this_attempt} (of {attempts}) download method {} for run {} ..".format(method, run_identifier))
+                if method == 'prefetch':
                     output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
                     try:
-                        if download_threads > 1:
-                            logging.info(
-                                "Downloading .SRA file from AWS Open Data Program HTTP link using aria2c ..")
-                            verbosity_flag = '--quiet' if hide_download_progress else ''
-                            # Redirect aria2c stdout to stderr so all logging of kingfisher is on stderr.
-                            # aria2c does not handle absolute paths properly, so we have to use a relative path.
-                            cmd = "aria2c {} -x{} -o {} '{}' 1>&2".format(
-                                verbosity_flag, download_threads, os.path.relpath(output_path), odp_link)
-                            subprocess.check_call(cmd, shell=True)
+                        if prefetch_max_size is None:
+                            prefetch_max_size_argument = '--max-size 0G'
                         else:
-                            logging.info(
-                                "Downloading .SRA file from AWS Open Data Program HTTP link using curl ..")
-                            verbosity_flag = '--silent --show-error' if hide_download_progress else ''
-                            cmd = "curl {} -o {} '{}'".format(verbosity_flag, output_path, odp_link)
-                            subprocess.check_call(cmd, shell=True)
-                        logging.info("Download finished, validating ..")
-                        # A download with curl of a bad AWS address does not
-                        # result in a non-zero exitstatus. Instead an XML
-                        # document is returned. If it is XML, then download has
-                        # failed.
-                        with open(output_path,'rb') as f:
-                            aws_failed = (f.read(8) != b'NCBI.sra')
-
-                        if aws_failed:
-                            logging.info("The file downloaded from AWS appears not to be a .sra file, deleting it, this download method failed")
-                            os.remove(output_path)
-                            return None
+                            prefetch_max_size_argument = '--max-size {}'.format(prefetch_max_size)
+                        extern.run("prefetch {} -o {} {}".format(
+                            prefetch_max_size_argument, output_path, run_identifier))
+                        if os.path.exists(output_path):
+                            downloaded_files = [output_path]
                         else:
-                            return [output_path]
-                    except subprocess.CalledProcessError as e:
-                        logging.warning("Method {} failed when downloading from {}: Error was: {}".format(method, odp_link, e))
+                            logging.warning("Method {} failed: Prefetch did not create file {}".format(method, output_path))
+                    except ExternCalledProcessError as e:
+                        logging.warning("Method {} failed: Error was: {}".format(method, e))
                         if os.path.exists(output_path):
                             logging.info("Removing file {} because download failed ..".format(output_path))
                             os.remove(output_path)
-                        return None
 
-                if guess_aws_location:
-                    # e.g. https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR12118866/SRR12118866
-                    guessed_location = 'https://sra-pub-run-odp.s3.amazonaws.com/sra/{}/{}'.format(run_identifier, run_identifier)
-                    logging.info("Guessing AWS-ODP link to be: {}".format(guessed_location))
-                    downloaded_files = download_from_aws(guessed_location, run_identifier, download_threads, method)
-                else:
-                    if ncbi_locations is None:
-                        ncbi_locations = Location.get_ncbi_locations(run_identifier)
-                    odp_http_locations = ncbi_locations.object_locations(
-                        NcbiLocationJson.OBJECT_TYPE_SRA, NcbiLocationJson.AWS_SERVICE, False
-                    )
-
-                    if len(odp_http_locations) > 0:
-                        for odp_http_location in odp_http_locations:
-                            logging.debug("Found ODP link {}".format(odp_http_location))
-                            logging.info("Found ODP link {}".format(odp_http_location.link()))
-                            odp_link = odp_http_location.link()
-                            downloaded_files = download_from_aws(odp_link, run_identifier, download_threads, method)
-                            if downloaded_files is not None and check_md5sums:
-                                for downloaded_file in downloaded_files:
-                                    # Is there always just 1 .sra file? There is only 1 md5sum
-                                    logging.info("Checking md5sum of downloaded file {} ..".format(downloaded_file))
-                                    if MD5.check_md5sum(downloaded_file, odp_http_location.md5sum()):
-                                        logging.info("MD5sum OK for {}".format(downloaded_file))
-                                    else:
-                                        logging.warning("MD5sum check failed for {}".format(downloaded_file))
-                    else:
-                        logging.warning("Method {} failed: No ODP URL could be found".format(method))
-
-            elif method == 'aws-cp':
-                if ncbi_locations is None:
-                    ncbi_locations = Location.get_ncbi_locations(run_identifier)
-
-                s3_locations = ncbi_locations.object_locations(
-                    NcbiLocationJson.OBJECT_TYPE_SRA,
-                    NcbiLocationJson.AWS_SERVICE,
-                    's3' in allowable_sources
-                )
-
-                # TODO: Sort so unpaid are first
-                output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
-
-                if len(s3_locations) > 0:
-                    for s3_location in s3_locations:
-                        logging.info("Found s3 link {}".format(s3_location.link()))
-
+                elif method == 'aws-http':
+                    def download_from_aws(odp_link, run_identifier, download_threads, method):
+                        output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
                         try:
-                            command = '{} {}'.format(
-                                s3_location.s3_command_prefix(run_identifier), output_path
-                            )
-                            if aws_user_key_id:
-                                os.environ['AWS_ACCESS_KEY_ID'] = aws_user_key_id
-                            if aws_user_key_id:
-                                os.environ['AWS_SECRET_ACCESS_KEY'] = aws_user_key_secret
-                            logging.info("Downloading from S3..")
-                            try:
-                                extern.run(command)
-                                downloaded_files = [output_path]
-                            except ExternCalledProcessError as e:
-                                logging.warning("Method {} failed: Error was: {}".format(method, e))
-                        except DownloadMethodFailed as e:
-                            logging.warning("Method {} failed, error was {}".format(
-                                method, e
-                            ))
+                            if download_threads > 1:
+                                logging.info(
+                                    "Downloading .SRA file from AWS Open Data Program HTTP link using aria2c ..")
+                                verbosity_flag = '--quiet' if hide_download_progress else ''
+                                # Redirect aria2c stdout to stderr so all logging of kingfisher is on stderr.
+                                # aria2c does not handle absolute paths properly, so we have to use a relative path.
+                                cmd = "aria2c {} -x{} -o {} '{}' 1>&2".format(
+                                    verbosity_flag, download_threads, os.path.relpath(output_path), odp_link)
+                                subprocess.check_call(cmd, shell=True)
+                            else:
+                                logging.info(
+                                    "Downloading .SRA file from AWS Open Data Program HTTP link using curl ..")
+                                verbosity_flag = '--silent --show-error' if hide_download_progress else ''
+                                cmd = "curl {} -o {} '{}'".format(verbosity_flag, output_path, odp_link)
+                                subprocess.check_call(cmd, shell=True)
+                            logging.info("Download finished, validating ..")
+                            # A download with curl of a bad AWS address does not
+                            # result in a non-zero exitstatus. Instead an XML
+                            # document is returned. If it is XML, then download has
+                            # failed.
+                            with open(output_path,'rb') as f:
+                                aws_failed = (f.read(8) != b'NCBI.sra')
+
+                            if aws_failed:
+                                logging.info("The file downloaded from AWS appears not to be a .sra file, deleting it, this download method failed")
+                                os.remove(output_path)
+                            else:
+                                return [output_path]
+                        except subprocess.CalledProcessError as e:
+                            logging.warning("Method {} failed when downloading from {}: Error was: {}".format(method, odp_link, e))
                             if os.path.exists(output_path):
                                 logging.info("Removing file {} because download failed ..".format(output_path))
                                 os.remove(output_path)
-                else:
-                    logging.warning("Method {} failed: No S3 location could be found".format(method))
-                    if os.path.exists(output_path):
-                        logging.info("Removing file {} because download failed ..".format(output_path))
-                        os.remove(output_path)
 
-            elif method == 'gcp-cp':
-                output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
-                if 'gcp' in allowable_sources:
+                    if guess_aws_location:
+                        # e.g. https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR12118866/SRR12118866
+                        guessed_location = 'https://sra-pub-run-odp.s3.amazonaws.com/sra/{}/{}'.format(run_identifier, run_identifier)
+                        logging.info("Guessing AWS-ODP link to be: {}".format(guessed_location))
+                        downloaded_files = download_from_aws(guessed_location, run_identifier, download_threads, method)
+                    else:
+                        if ncbi_locations is None:
+                            ncbi_locations = Location.get_ncbi_locations(run_identifier)
+                        odp_http_locations = ncbi_locations.object_locations(
+                            NcbiLocationJson.OBJECT_TYPE_SRA, NcbiLocationJson.AWS_SERVICE, False
+                        )
+
+                        if len(odp_http_locations) > 0:
+                            for odp_http_location in odp_http_locations:
+                                logging.debug("Found ODP link {}".format(odp_http_location))
+                                logging.info("Found ODP link {}".format(odp_http_location.link()))
+                                odp_link = odp_http_location.link()
+                                downloaded_files = download_from_aws(odp_link, run_identifier, download_threads, method)
+                                if downloaded_files is not None and check_md5sums:
+                                    for downloaded_file in downloaded_files:
+                                        # Is there always just 1 .sra file? There is only 1 md5sum
+                                        logging.info("Checking md5sum of downloaded file {} ..".format(downloaded_file))
+                                        if MD5.check_md5sum(downloaded_file, odp_http_location.md5sum()):
+                                            logging.info("MD5sum OK for {}".format(downloaded_file))
+                                        else:
+                                            logging.warning("MD5sum check failed for {}".format(downloaded_file))
+                        else:
+                            logging.warning("Method {} failed: No ODP URL could be found".format(method))
+                            this_attempt = attempts
+
+                elif method == 'aws-cp':
                     if ncbi_locations is None:
                         ncbi_locations = Location.get_ncbi_locations(run_identifier)
-                    locations = ncbi_locations.object_locations(
-                        NcbiLocationJson.OBJECT_TYPE_SRA, NcbiLocationJson.GCP_SERVICE, True
+
+                    s3_locations = ncbi_locations.object_locations(
+                        NcbiLocationJson.OBJECT_TYPE_SRA,
+                        NcbiLocationJson.AWS_SERVICE,
+                        's3' in allowable_sources
                     )
-                    if len(locations) > 0:
-                        for loc in locations:
-                            command = 'gsutil'
-                            gcp_project = gcp_project
-                            if gcp_user_key_file:
-                                with open(gcp_user_key_file) as f:
-                                    j = json.load(f)
-                                    if 'project_id' not in j:
-                                        raise Exception("Unexpectedly could not find project_id in GCP user key JSON file")
-                                    gcp_project = j['project_id']
-                                extern.run('gcloud auth activate-service-account --key-file={}'.format(gcp_user_key_file))
 
-                            failed = False
-                            if gcp_project:
-                                command = command + " -u {}".format(gcp_project)
-                            else:
-                                logging.info("Finding Google cloud project to charge")
-                                project_id = extern.run('gcloud config get-value project').strip()
-                                if project_id == '':
-                                    logging.warning("Method gcp-cp failed: Could not find a GCP project to charge, cannot continue. "\
-                                        "Expected a project from 'gcloud config get-value project' or specified with --gcp-user-key-file or --gcp-project")
-                                    failed = True
-                                else:
-                                    logging.info("Charging to project \'{}\'".format(project_id))
-                                    command = command + " -u {}".format(project_id)
-                            if not failed:
+                    # TODO: Sort so unpaid are first
+                    output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
+
+                    if len(s3_locations) > 0:
+                        for s3_location in s3_locations:
+                            logging.info("Found s3 link {}".format(s3_location.link()))
+
+                            try:
+                                command = '{} {}'.format(
+                                    s3_location.s3_command_prefix(run_identifier), output_path
+                                )
+                                if aws_user_key_id:
+                                    os.environ['AWS_ACCESS_KEY_ID'] = aws_user_key_id
+                                if aws_user_key_id:
+                                    os.environ['AWS_SECRET_ACCESS_KEY'] = aws_user_key_secret
+                                logging.info("Downloading from S3..")
                                 try:
-                                    gs_path = loc.gs_path()
-                                    command += ' cp {} {}'.format(
-                                        gs_path, output_path
-                                    )
-                                    logging.info("Downloading from GCP..")
-                                    try:
-                                        extern.run(command)
-                                        downloaded_files = [output_path]
-                                    except ExternCalledProcessError as e:
-                                        logging.warning("Method {} failed: Error was: {}".format(method, e))
-                                        
-                                except DownloadMethodFailed as e:
-                                    logging.warning("Method {} failed, error was {}".format(
-                                        method, e
-                                    ))
-                                    if os.path.exists(output_path):
-                                        logging.info("Removing file {} because download failed ..".format(output_path))
-                                        os.remove(output_path)
+                                    extern.run(command)
+                                    downloaded_files = [output_path]
+                                except ExternCalledProcessError as e:
+                                    logging.warning("Method {} failed: Error was: {}".format(method, e))
+                            except DownloadMethodFailed as e:
+                                logging.warning("Method {} failed, error was {}".format(
+                                    method, e
+                                ))
+                                if os.path.exists(output_path):
+                                    logging.info("Removing file {} because download failed ..".format(output_path))
+                                    os.remove(output_path)
                     else:
-                        logging.warning("Method {} failed: No GCP location could be found".format(method))
+                        logging.warning("Method {} failed: No S3 location could be found".format(method))
+                        if os.path.exists(output_path):
+                            logging.info("Removing file {} because download failed ..".format(output_path))
+                            os.remove(output_path)
+                        this_attempt = attempts
+
+                elif method == 'gcp-cp':
+                    output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
+                    if 'gcp' in allowable_sources:
+                        if ncbi_locations is None:
+                            ncbi_locations = Location.get_ncbi_locations(run_identifier)
+                        locations = ncbi_locations.object_locations(
+                            NcbiLocationJson.OBJECT_TYPE_SRA, NcbiLocationJson.GCP_SERVICE, True
+                        )
+                        if len(locations) > 0:
+                            for loc in locations:
+                                command = 'gsutil'
+                                gcp_project = gcp_project
+                                if gcp_user_key_file:
+                                    with open(gcp_user_key_file) as f:
+                                        j = json.load(f)
+                                        if 'project_id' not in j:
+                                            raise Exception("Unexpectedly could not find project_id in GCP user key JSON file")
+                                        gcp_project = j['project_id']
+                                    extern.run('gcloud auth activate-service-account --key-file={}'.format(gcp_user_key_file))
+
+                                failed = False
+                                if gcp_project:
+                                    command = command + " -u {}".format(gcp_project)
+                                else:
+                                    logging.info("Finding Google cloud project to charge")
+                                    project_id = extern.run('gcloud config get-value project').strip()
+                                    if project_id == '':
+                                        logging.warning("Method gcp-cp failed: Could not find a GCP project to charge, cannot continue. "\
+                                            "Expected a project from 'gcloud config get-value project' or specified with --gcp-user-key-file or --gcp-project")
+                                        failed = True
+                                        this_attempt = attempts
+                                    else:
+                                        logging.info("Charging to project \'{}\'".format(project_id))
+                                        command = command + " -u {}".format(project_id)
+                                if not failed:
+                                    try:
+                                        gs_path = loc.gs_path()
+                                        command += ' cp {} {}'.format(
+                                            gs_path, output_path
+                                        )
+                                        logging.info("Downloading from GCP..")
+                                        try:
+                                            extern.run(command)
+                                            downloaded_files = [output_path]
+                                        except ExternCalledProcessError as e:
+                                            logging.warning("Method {} failed: Error was: {}".format(method, e))
+
+                                    except DownloadMethodFailed as e:
+                                        logging.warning("Method {} failed, error was {}".format(
+                                            method, e
+                                        ))
+                                        if os.path.exists(output_path):
+                                            logging.info("Removing file {} because download failed ..".format(output_path))
+                                            os.remove(output_path)
+                        else:
+                            logging.warning("Method {} failed: No GCP location could be found".format(method))
+                            this_attempt = attempts
+                    else:
+                        logging.warning("Not using method gcp-cp as --allow-paid was not specified")
+                        this_attempt = attempts
+
+                elif method == 'ena-ascp':
+                    result = EnaDownloader().download_with_aspera(run_identifier, output_directory,
+                        ascp_args=ascp_args,
+                        ssh_key=ascp_ssh_key,
+                        check_md5sums=check_md5sums)
+                    if result is not False:
+                        try:
+                            gzip_test_files(result)
+                            downloaded_files = result
+                        except ExternCalledProcessError as e:
+                            logging.warning(f"gzip test failed on attempt {this_attempt}: {e}")
+                            logging.info(f"Deleting downloaded files and retrying...")
+                            for f in result:
+                                try:
+                                    os.remove(f)
+                                except OSError as err:
+                                    logging.error(f"Failed to delete file {f}: {err}")
+
+                elif method == 'ena-ftp':
+                    result = EnaDownloader().download_with_curl(
+                        run_identifier,
+                        download_threads,
+                        output_directory,
+                        check_md5sums=check_md5sums)
+                    if result is not False:
+                        try:
+                            gzip_test_files(result)
+                            downloaded_files = result
+                        except ExternCalledProcessError as e:
+                            logging.warning(f"gzip test failed on attempt {this_attempt}: {e}")
+                            logging.info(f"Deleting downloaded files and retrying...")
+                            for f in result:
+                                try:
+                                    os.remove(f)
+                                except OSError as err:
+                                    logging.error(f"Failed to delete file {f}: {err}")
                 else:
-                    logging.warning("Not using method gcp-cp as --allow-paid was not specified")
+                    raise Exception("Unknown method: {}".format(method))
 
-            elif method == 'ena-ascp':
-                result = EnaDownloader().download_with_aspera(run_identifier, output_directory,
-                    ascp_args=ascp_args,
-                    ssh_key=ascp_ssh_key,
-                    check_md5sums=check_md5sums)
-                if result is not False:
-                    gzip_test_files(result)
-                    downloaded_files = result
-
-            elif method == 'ena-ftp':
-                result = EnaDownloader().download_with_curl(
-                    run_identifier,
-                    download_threads,
-                    output_directory,
-                    check_md5sums=check_md5sums)
-                if result is not False:
-                    gzip_test_files(result)
-                    downloaded_files = result
-
-            else:
-                raise Exception("Unknown method: {}".format(method))
-            
             if downloaded_files is not None:
                 logging.info("Method {} worked.".format(method))
                 break
