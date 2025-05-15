@@ -147,7 +147,7 @@ def download_and_extract_one_run(run_identifier, **kwargs):
             this_attempt = 0
             while downloaded_files is None and this_attempt < attempts:
                 this_attempt += 1
-                logging.info("Attempt {this_attempt} (of {attempts}) download method {} for run {} ..".format(method, run_identifier))
+                logging.info("Attempt {} (of {}) download method {} for run {} ..".format(this_attempt, attempts, method, run_identifier))
                 if method == 'prefetch':
                     output_path = output_location_factory.output_stem('{}.sra'.format(run_identifier))
                     try:
